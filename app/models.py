@@ -31,3 +31,7 @@ READING_SUPERSEDED = "superseded"
 # 误采作废：作废本身作为该 ID 的一条修订留存（原因/操作时间/前一版本），
 # 留存期间该 ID 没有活动读数；更高修订号提交可恢复
 READING_VOIDED = "voided"
+
+# 证书有效性：撤销只改变 revoked 标志，版本/结论/快照均不变
+CERTIFICATE_VALID = "valid"
+CERTIFICATE_REVOKED = "revoked"

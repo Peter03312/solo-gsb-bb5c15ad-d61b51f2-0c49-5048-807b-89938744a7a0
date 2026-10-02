@@ -236,6 +236,10 @@ class WindowOut(BaseModel):
     active_readings: list[ReadingOut] = []
     latest_certificate_version: Optional[int] = None
     latest_verdict: Optional[str] = None
+    current_certificate_id: Optional[int] = Field(
+        None, description="当前可用证书主键（仅详情端点返回；最新版本未撤销才有值，不自动退回旧版）")
+    current_certificate: Optional[CertificateOut] = Field(
+        None, description="当前可用证书完整内容（仅详情端点返回）；不可用时为 null")
 
 
 class ReadingSubmitResponse(BaseModel):
@@ -309,6 +313,72 @@ class CertificateOut(BaseModel):
     issued_at: str
     note: Optional[str]
     snapshot: dict[str, Any]
+    revoked: bool = Field(False, description="是否已撤销；撤销只改变有效性，版本/结论/快照不变")
+    status: str = Field("valid", description="证书有效性：valid（当前有效）| revoked（已撤销）")
+    revocation: Optional["CertificateRevocationOut"] = Field(
+        None, description="撤销记录（撤销时间与原因）；未撤销为 null")
+
+
+# ------------------------------------------------------------ 证书撤销
+
+class CertificateRevokeSubmit(BaseModel):
+    """馆员撤销已签发证书：凭非空原因（证书标识在路径中给出）。
+
+    - 撤销只改变证书有效性，不改动原证书的版本、结论与不可变快照；
+    - 同一证书以相同原因重复撤销 -> 幂等返回原撤销记录（effect=idempotent，
+      不产生新事件）；原因不同 -> 409；
+    - 原因为空或只含空白 -> 422；证书不存在 -> 404。
+    """
+
+    reason: str = Field(..., min_length=1, max_length=500,
+                        description="撤销依据有误等原因（非空，不能只含空白字符）")
+
+    @field_validator("reason")
+    @classmethod
+    def _non_blank(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("撤销原因不能为空（不能只含空白字符）")
+        return v
+
+
+class CertificateRevocationOut(BaseModel):
+    """证书撤销记录：撤销时间与原因（撤销不改动证书版本/结论/快照）。"""
+
+    certificate_id: int
+    window_id: int
+    version: int = Field(..., description="被撤销证书的版本号（原样保留）")
+    reason: str = Field(..., description="撤销原因")
+    revoked_at: str = Field(..., description="撤销操作时间（UTC）")
+
+
+class CertificateRevokeResponse(BaseModel):
+    effect: str = Field(..., description="revoked（首次撤销）| idempotent（同原因重复撤销）")
+    revocation: CertificateRevocationOut
+    certificate: CertificateOut = Field(..., description="撤销后的证书（含撤销状态；快照不变）")
+
+
+class CertificateRevocationStatusOut(BaseModel):
+    """单张证书的撤销状态查询结果。"""
+
+    certificate_id: int
+    window_id: int
+    version: int
+    revoked: bool = Field(..., description="是否已撤销")
+    status: str = Field(..., description="valid | revoked")
+    revocation: Optional[CertificateRevocationOut] = Field(
+        None, description="撤销时间与原因；未撤销为 null")
+    certificate: CertificateOut
+
+
+class CurrentCertificateOut(BaseModel):
+    """窗口当前可用证书：仅最新签发版本且未撤销时才可用。"""
+
+    window_id: int
+    available: bool = Field(..., description="最新签发版本未撤销为 true；无证书或最新版已撤销为 false")
+    reason: Optional[str] = Field(
+        None, description="不可用原因：no_certificate（从未签发）| latest_revoked（最新版本已撤销）")
+    certificate: Optional[CertificateOut] = Field(
+        None, description="当前可用证书；不可用时为 null（不会自动退回旧版）")
 
 
 # ------------------------------------------------------------ 修订影响报告
@@ -389,6 +459,10 @@ class ReportCertificateRef(BaseModel):
     verdict_label_zh: str
     issued_at: str
     note: Optional[str]
+    revoked: bool = Field(False, description="该证书在查询时是否已撤销（报告仍只比对其历史快照）")
+    status: str = Field("valid", description="证书有效性：valid | revoked")
+    revocation: Optional[CertificateRevocationOut] = Field(
+        None, description="撤销记录（撤销时间与原因）；未撤销为 null")
 
 
 class ReportSummary(BaseModel):

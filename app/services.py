@@ -8,9 +8,10 @@ from typing import Any, Optional
 from fastapi import HTTPException, status
 
 from .evaluation import evaluate
-from .models import READING_VOIDED, VERDICT_LABELS_ZH
+from .models import CERTIFICATE_REVOKED, CERTIFICATE_VALID, READING_VOIDED, VERDICT_LABELS_ZH
 from .report import build_revision_report
 from .schemas import (
+    CertificateRevokeSubmit,
     ReadingBatchSubmit,
     ReadingSubmit,
     ReadingVoidSubmit,
@@ -704,6 +705,11 @@ def window_detail(conn: sqlite3.Connection, row: sqlite3.Row) -> dict[str, Any]:
     data = window_to_dict(conn, row)
     data["active_readings"] = [reading_to_dict(r) for r in list_active_readings(conn, row["id"])]
     data["current_evaluation"] = compute_evaluation(conn, row)
+    # 当前可用证书：仅最新签发版本未撤销；已撤销不自动退回旧版
+    current = get_current_certificate(conn, row["id"])
+    cert = current["certificate"]
+    data["current_certificate"] = cert
+    data["current_certificate_id"] = cert["id"] if cert else None
     return data
 
 
@@ -974,7 +980,8 @@ def get_certificate_row(conn: sqlite3.Connection, certificate_id: int) -> sqlite
 
 
 def get_certificate(conn: sqlite3.Connection, certificate_id: int) -> dict[str, Any]:
-    return certificate_to_dict(get_certificate_row(conn, certificate_id))
+    row = get_certificate_row(conn, certificate_id)
+    return certificate_to_dict(row, _revocation_row_for_certificate(conn, certificate_id))
 
 
 def list_certificates(conn: sqlite3.Connection, window_id: int) -> list[dict[str, Any]]:
@@ -982,11 +989,39 @@ def list_certificates(conn: sqlite3.Connection, window_id: int) -> list[dict[str
     rows = conn.execute(
         "SELECT * FROM certificates WHERE window_id=? ORDER BY version ASC", (window_id,)
     ).fetchall()
-    return [certificate_to_dict(r) for r in rows]
+    revs = {
+        r["certificate_id"]: r
+        for r in conn.execute(
+            "SELECT * FROM certificate_revocations WHERE window_id=?", (window_id,)
+        ).fetchall()
+    }
+    return [certificate_to_dict(r, revs.get(r["id"])) for r in rows]
 
 
-def certificate_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+def _revocation_row_for_certificate(
+    conn: sqlite3.Connection, certificate_id: int
+) -> Optional[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM certificate_revocations WHERE certificate_id=?",
+        (certificate_id,),
+    ).fetchone()
+
+
+def revocation_to_dict(row: sqlite3.Row, cert_row: sqlite3.Row) -> dict[str, Any]:
+    """撤销记录 -> API 输出（带被撤销证书的版本号）。"""
+    return {
+        "certificate_id": row["certificate_id"],
+        "window_id": row["window_id"],
+        "version": cert_row["version"],
+        "reason": row["reason"],
+        "revoked_at": row["revoked_at"],
+    }
+
+
+def certificate_to_dict(row: sqlite3.Row,
+                        revocation_row: Optional[sqlite3.Row] = None) -> dict[str, Any]:
     verdict = row["verdict"]
+    revoked = revocation_row is not None
     return {
         "id": row["id"],
         "window_id": row["window_id"],
@@ -996,7 +1031,103 @@ def certificate_to_dict(row: sqlite3.Row) -> dict[str, Any]:
         "issued_at": row["issued_at"],
         "note": row["note"],
         "snapshot": json.loads(row["snapshot_json"]),
+        "revoked": revoked,
+        "status": CERTIFICATE_REVOKED if revoked else CERTIFICATE_VALID,
+        "revocation": revocation_to_dict(revocation_row, row) if revoked else None,
     }
+
+
+# ---------------------------------------------------------------- 证书撤销
+
+def revoke_certificate(
+    conn: sqlite3.Connection, certificate_id: int, payload: CertificateRevokeSubmit
+) -> tuple[str, dict[str, Any], dict[str, Any]]:
+    """撤销已签发证书，返回 (effect, revocation_dict, certificate_dict)。
+
+    调用方需已持有写事务（BEGIN IMMEDIATE），因此与签发并发时以实际提交
+    顺序为准：撤销只在证书行已存在的提交之后才可能命中。
+
+    - 撤销只改变证书有效性：原证书的版本、结论与不可变快照均不改动；
+    - 相同原因重复撤销 -> ("idempotent", 原撤销记录, 证书)，不产生新事件；
+    - 已有撤销记录但原因不同 -> 409；证书不存在 -> 404。
+    """
+    cert_row = get_certificate_row(conn, certificate_id)
+    existing = _revocation_row_for_certificate(conn, certificate_id)
+    if existing is not None:
+        if existing["reason"] != payload.reason:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    f"证书 {certificate_id} 已撤销但撤销原因冲突："
+                    f"已存「{existing['reason']}」，本次「{payload.reason}」。"
+                    "同一证书重复撤销必须原因一致（同原因重放为幂等，不产生新事件）。"
+                ),
+            )
+        cert_dict = certificate_to_dict(cert_row, existing)
+        return "idempotent", cert_dict["revocation"], cert_dict
+
+    # 首次撤销：只新增撤销记录，certificates 行（版本/结论/快照）原样不动
+    try:
+        cur = conn.execute(
+            "INSERT INTO certificate_revocations (certificate_id, window_id, reason) "
+            "VALUES (?, ?, ?)",
+            (certificate_id, cert_row["window_id"], payload.reason),
+        )
+    except sqlite3.IntegrityError:
+        # 并发兜底：唯一约束 certificate_id 已被另一已提交事务占用
+        existing = _revocation_row_for_certificate(conn, certificate_id)
+        if existing is not None and existing["reason"] == payload.reason:
+            cert_dict = certificate_to_dict(cert_row, existing)
+            return "idempotent", cert_dict["revocation"], cert_dict
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"证书 {certificate_id} 已被并发撤销，撤销原因与本次不一致。",
+        )
+    rev_row = conn.execute(
+        "SELECT * FROM certificate_revocations WHERE id=?", (cur.lastrowid,)
+    ).fetchone()
+    cert_dict = certificate_to_dict(cert_row, rev_row)
+    return "revoked", cert_dict["revocation"], cert_dict
+
+
+def get_revocation(conn: sqlite3.Connection, certificate_id: int) -> dict[str, Any]:
+    """查询单张证书的撤销记录（撤销时间与原因）。
+
+    证书不存在 -> 404；证书存在但未撤销 -> revoked=false、revocation=null。
+    """
+    cert_row = get_certificate_row(conn, certificate_id)
+    rev_row = _revocation_row_for_certificate(conn, certificate_id)
+    cert_dict = certificate_to_dict(cert_row, rev_row)
+    return {
+        "certificate_id": cert_row["id"],
+        "window_id": cert_row["window_id"],
+        "version": cert_row["version"],
+        "revoked": rev_row is not None,
+        "status": cert_dict["status"],
+        "revocation": cert_dict["revocation"],
+        "certificate": cert_dict,
+    }
+
+def get_current_certificate(conn: sqlite3.Connection, window_id: int) -> dict[str, Any]:
+    """窗口当前可用证书：仅最新签发版本未撤销时才可用。
+
+    撤销最新版后不自动退回旧版；旧版即使未撤销也不是“当前可用证书”。
+    窗口不存在 -> 404；无证书或最新版已撤销 -> available=false（证书为 null）。
+    """
+    get_window_row(conn, window_id)
+    latest = conn.execute(
+        "SELECT * FROM certificates WHERE window_id=? ORDER BY version DESC LIMIT 1",
+        (window_id,),
+    ).fetchone()
+    if latest is None:
+        return {"window_id": window_id, "available": False,
+                "reason": "no_certificate", "certificate": None}
+    rev_row = _revocation_row_for_certificate(conn, latest["id"])
+    if rev_row is not None:
+        return {"window_id": window_id, "available": False,
+                "reason": "latest_revoked", "certificate": None}
+    return {"window_id": window_id, "available": True, "reason": None,
+            "certificate": certificate_to_dict(latest)}
 
 
 # ---------------------------------------------------------------- 修订影响报告
@@ -1055,6 +1186,8 @@ def revision_report(conn: sqlite3.Connection,
             ),
         )
 
-    old_cert = certificate_to_dict(old_row)
-    new_cert = certificate_to_dict(new_row)
+    old_cert = certificate_to_dict(
+        old_row, _revocation_row_for_certificate(conn, old_row["id"]))
+    new_cert = certificate_to_dict(
+        new_row, _revocation_row_for_certificate(conn, new_row["id"]))
     return build_revision_report(old_cert, new_cert)

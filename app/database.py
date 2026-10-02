@@ -104,6 +104,21 @@ CREATE TABLE IF NOT EXISTS certificates (
 
 CREATE INDEX IF NOT EXISTS idx_certificates_window
     ON certificates(window_id, version);
+
+-- 证书撤销：撤销只改变有效性，证书版本/结论/快照原样保留。
+-- 每张已签发证书至多一条撤销记录（certificate_id 唯一）：
+-- 相同原因重复撤销返回原记录（幂等，不产生新事件）；原因不同即冲突。
+CREATE TABLE IF NOT EXISTS certificate_revocations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    certificate_id INTEGER NOT NULL REFERENCES certificates(id),
+    window_id INTEGER NOT NULL REFERENCES windows(id),
+    reason TEXT NOT NULL,                   -- 非空撤销原因（不能只含空白）
+    revoked_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    UNIQUE(certificate_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_certificate_revocations_window
+    ON certificate_revocations(window_id);
 """
 
 # 旧库迁移：CREATE TABLE IF NOT EXISTS 不会给已存在的表补列，

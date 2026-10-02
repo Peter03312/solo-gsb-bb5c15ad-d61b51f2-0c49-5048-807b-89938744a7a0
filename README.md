@@ -7,9 +7,12 @@
 **误采作废与恢复（作废留存修订：原因/操作时间/前一版本；更高修订号恢复）**、
 证书版本化签发（快照不可变），支持馆员对窗口四项审定规则做
 **版本化修订**（初始规则为第 1 版，连续修订号 + 非空原因，立即重算、
-既有证书快照不变），并可对同一审定窗口的两张已签发证书生成
+既有证书快照不变），支持馆员对已签发证书做
+**依据有误撤销**（证书标识 + 非空原因，撤销只改有效性、版本/结论/快照不变，
+同原因重放幂等、异因冲突；窗口仅最新签发版本未撤销时才有当前可用证书，
+撤销不退回旧版、重签沿用递增版本），并可对同一审定窗口的两张已签发证书生成
 **修订影响报告**（只读快照比对：规则四项前后值、读数新增/变更/移除、
-时间线状态变化半开区间、结论与最长连续超限时长变化）。
+时间线状态变化半开区间、结论与最长连续超限时长变化，并标示两证撤销状态）。
 
 - 技术栈：Python 3.11 · FastAPI · SQLite（WAL 模式）· Pydantic v2
 - 无外部服务依赖，`docker compose up -d` 一键启动并自动初始化数据库
@@ -156,6 +159,41 @@
 - 数据库开启 **WAL**，写事务使用 `BEGIN IMMEDIATE` + `busy_timeout`：
   签发（读）与修订（写）并发时，以事务为边界取同一已提交状态——
   修订先提交则纳入本次签发，否则等签发完成后再生效，不会出现脏读或快照撕裂。
+
+### 证书撤销（依据有误）
+
+馆员发现已签发证书依据有误时，
+`POST /api/v1/certificates/{id}/revoke` 凭**证书标识 + 非空原因**撤销
+（请求体 `{"reason":"..."}`）：
+
+- 撤销**只改变证书有效性**：原证书的 `version`、`verdict`、签发时间、备注与
+  不可变 `snapshot` 全部原样保留；响应与查询以 `revoked=true`、
+  `status="revoked"` 标示，并返回撤销记录 `revocation`
+  （`certificate_id` / `window_id` / `version` / `reason` / `revoked_at`）。
+- **幂等与冲突**：
+  - 同一证书以**相同原因**重复撤销 → 返回**原撤销记录**（`effect: idempotent`，
+    `revoked_at` 不变，不产生新事件、不新增撤销行）；
+  - 已撤销但本次**原因不同** → **409**（原记录保持不变）；
+  - 原因为空或只含空白、缺字段 → **422**；证书不存在 → **404**。
+- **查询**：
+  - `GET /api/v1/certificates/{id}/revocation` 查询撤销时间与原因
+    （证书存在但未撤销时 `revoked=false`、`revocation=null`）；
+  - `GET /api/v1/windows/{id}/current-certificate` 查询窗口**当前可用证书**：
+    一个窗口**只有最新签发版本未撤销时**才有当前可用证书
+    （`available=true`）；从未签发返回 `reason=no_certificate`，
+    最新版本已撤销返回 `reason=latest_revoked` 且 `certificate=null`。
+- **撤销不退回旧版**：撤销最新版本后，即使更早版本仍有效也不会成为当前
+  可用证书；**再次签发沿用递增版本号**（如撤销 v1 后重签为 v2），新版本
+  即当前可用证书。
+- **历史仍可读**：`GET /api/v1/certificates/{id}`、
+  `GET /api/v1/windows/{id}/certificates`、窗口详情与修订影响报告都仍可
+  读取已撤销证书，并随证书给出 `revoked` / `status` / `revocation`
+  （报告中的两证引用标示查询时撤销状态，比对内容仍只取自各自不可变快照）。
+  窗口详情新增 `current_certificate` / `current_certificate_id`（不可用时为
+  `null`）；均为增量字段，既有字段含义不变。
+- **并发**：撤销与签发都在 `BEGIN IMMEDIATE` 写事务内执行，二者并发时
+  以**实际提交顺序**为准——撤销先提交则命中当版证书，签先发提交则撤销
+  命中更早版本、新签发版本未撤销并成为当前可用证书，不会出现脏状态。
 
 ---
 
@@ -308,13 +346,19 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | `POST` | `/api/v1/windows/{id}/certificates/issue` | 签发（可带 `{"note":"..."}`，也可空 body） |
-| `GET` | `/api/v1/windows/{id}/certificates` | 该窗口全部证书版本（按版本升序） |
-| `GET` | `/api/v1/certificates/{id}` | 按证书主键获取，`snapshot` 为签发时不可变快照 |
-| `GET` | `/api/v1/certificates/revision-report?old_certificate_id=&new_certificate_id=` | 对同一窗口两张已签发证书生成修订影响报告 |
+| `GET` | `/api/v1/windows/{id}/certificates` | 该窗口全部证书版本（按版本升序；含 `revoked`/`status`/`revocation` 撤销标示） |
+| `GET` | `/api/v1/windows/{id}/current-certificate` | 窗口当前可用证书：仅最新签发版本未撤销时可用；无证书/最新版已撤销时 `available=false`（不退回旧版） |
+| `POST` | `/api/v1/certificates/{id}/revoke` | 撤销已签发证书（`{"reason":"非空原因"}`）：只改有效性；同原因重放幂等、原因不同 409、空白原因 422、不存在 404 |
+| `GET` | `/api/v1/certificates/{id}/revocation` | 查询撤销时间与原因（未撤销时 `revoked=false`、`revocation=null`；不存在 404） |
+| `GET` | `/api/v1/certificates/{id}` | 按证书主键获取，`snapshot` 为签发时不可变快照；已撤销证书带撤销状态与撤销记录 |
+| `GET` | `/api/v1/certificates/revision-report?old_certificate_id=&new_certificate_id=` | 对同一窗口两张已签发证书生成修订影响报告（两证引用随当前撤销状态标示） |
 
 证书含 `id`、`window_id`、`version`、`verdict`、`verdict_label_zh`
 （合格/待定/不合格）、`issued_at`、`note`、`snapshot`。`snapshot.window`
 带签发时的规则修订号 `rule_revision`（规则版本化之前的旧证书按第 1 版解读）。
+证书另带 `revoked`（是否已撤销）、`status`（`valid`/`revoked`）与
+`revocation`（撤销时间与原因；未撤销为 `null`）；撤销只改变这三项，
+证书版本、结论与 `snapshot` 永不变更。
 
 ### 修订影响报告
 
@@ -429,11 +473,13 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 - `409`：同 ID+修订号内容冲突；旧修订号覆盖（单条与批量语义一致）；
   作废修订号原因冲突或不高于当前修订号；已作废读数再次以新修订号作废；
   以不高于作废修订号的提交尝试复活读数；
-  规则修订同号但四项值/原因不一致、旧号提交、跳号提交
+  规则修订同号但四项值/原因不一致、旧号提交、跳号提交；
+  证书已撤销但重复撤销原因不同
 - `422`：无效窗口、窗口外读数、同刻不同读数（批量按最终状态判定）、
   批量请求为空批次/同批 `reading_id` 重复、缺时区/字段非法、
   作废原因为空或只含空白等；
   规则修订数值非有限、温度下限大于上限、时长非正、原因为空或只含空白；
+  撤销原因为空或只含空白；
   修订影响报告的两证书相同、跨审定窗口、版本未按先后排列也返回 422
 
 > 批量补传中任一项命中 409/422，整批回滚，错误 `detail` 指出具体原因；
@@ -446,10 +492,10 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 服务启动后：
 
 ```bash
-# curl 全流程（创建窗口 → 提交/幂等/冲突/修订 → 审定 → 两次签发 → 修订影响报告 → 批量补传 → 误采作废与恢复 → 规则版本化修订与跨规则版本报告）
+# curl 全流程（创建窗口 → 提交/幂等/冲突/修订 → 审定 → 两次签发 → 修订影响报告 → 批量补传 → 误采作废与恢复 → 规则版本化修订与跨规则版本报告 → 证书撤销/重签/当前可用证书）
 bash examples/curl-examples.sh
 
-# Python 全流程（仅标准库，演示三种结论、拒收、修订、版本快照、修订影响报告、批量补传、误采作废与恢复、规则版本化修订与跨规则版本报告）
+# Python 全流程（仅标准库，演示三种结论、拒收、修订、版本快照、修订影响报告、批量补传、误采作废与恢复、规则版本化修订与跨规则版本报告、证书撤销幂等/冲突/重签与当前可用证书）
 python3 examples/python_client.py
 # 或指定地址：
 BASE_URL=http://127.0.0.1:8000 python3 examples/python_client.py
@@ -535,6 +581,27 @@ curl -sS http://localhost:8000/api/v1/windows/1/rule-revisions \
 curl -sS http://localhost:8000/api/v1/windows/1/rule-revisions
 ```
 
+证书撤销最小示例（承接窗口 1 与一张已签发证书；`CID` 为证书主键）：
+
+```bash
+# 撤销：证书标识 + 非空原因；只改变有效性，版本/结论/快照原样保留
+curl -sS -X POST http://localhost:8000/api/v1/certificates/$CID/revoke \
+  -H 'Content-Type: application/json' \
+  -d '{"reason":"依据有误：读数来源仪器未校准"}'
+# 同原因重放 -> effect=idempotent 返回原记录（revoked_at 不变，不产生新事件）；
+# 原因不同 -> 409；空白原因/缺字段 -> 422；证书不存在 -> 404
+
+# 查询撤销时间与原因（未撤销时 revoked=false、revocation=null）
+curl -sS http://localhost:8000/api/v1/certificates/$CID/revocation
+
+# 查询窗口当前可用证书：仅最新签发版本未撤销时可用；
+# 撤销最新版后不自动退回旧版（reason=latest_revoked）
+curl -sS http://localhost:8000/api/v1/windows/1/current-certificate
+# 再次签发沿用递增版本号并成为当前可用证书
+curl -sS -X POST http://localhost:8000/api/v1/windows/1/certificates/issue \
+  -H 'Content-Type: application/json' -d '{"note":"撤销后重签"}'
+```
+
 ---
 
 ## 5. 测试
@@ -566,18 +633,25 @@ PYTHONPATH=. python -m pytest tests/ -q
   窗口 404、窗口起止与读数不变、旧证快照不变与后续签发采用新规则、
   跨规则版本报告分别依两证快照重建时间线并给出四项规则前后值、
   即使结论不变规则变化仍可见、旧库第 1 版回填幂等）。
+- `tests/test_revoke_api.py`：证书撤销 HTTP 测试（撤销只改有效性、版本/结论/
+  快照不变，撤销时间与原因查询，旧版证书也可撤销；同原因重放幂等返回原记录
+  不产生新事件、原因不同 409、空白原因/缺字段 422、证书不存在 404；
+  当前可用证书仅最新签发版本未撤销、从未签发 no_certificate、撤销最新版
+  latest_revoked 且不退回旧版、重签沿用递增版本并成为当前可用证书；
+  证书查询/列表/窗口详情/修订影响报告可读取历史证书并标示撤销状态；
+  撤销与签发并发以实际提交顺序串行化、并发重复撤销恰产生一条记录）。
 
 ## 6. 目录结构
 
 ```
 app/
   config.py        # 环境变量配置
-  database.py      # SQLite 连接、WAL、建表（含旧库补列迁移/规则第 1 版回填）、写事务（BEGIN IMMEDIATE）
+  database.py      # SQLite 连接、WAL、建表（含旧库补列迁移/规则第 1 版回填/撤销表）、写事务（BEGIN IMMEDIATE）
   evaluation.py    # 核心审定算法（纯函数）
   report.py        # 修订影响报告（规则前后值、快照比对、时间线对齐，纯函数）
-  models.py        # 结论枚举/常量
-  schemas.py       # Pydantic 请求/响应模型（含规则修订）
-  services.py      # 窗口、窗口规则版本化修订、读数（含误采作废/恢复）、审定、签发、修订影响报告业务逻辑
+  models.py        # 结论/证书有效性枚举/常量
+  schemas.py       # Pydantic 请求/响应模型（含规则修订、证书撤销）
+  services.py      # 窗口、窗口规则版本化修订、读数（含误采作废/恢复）、审定、签发、证书撤销、当前可用证书、修订影响报告业务逻辑
   main.py          # FastAPI 路由
 examples/
   curl-examples.sh

@@ -17,7 +17,11 @@
   7) 窗口规则版本化修订：初始规则第 1 版、连续修订号（当前版+1）生效、
      同号同值同原因幂等/冲突 409、旧号与跳号 409、非法输入 422、
      立即重算、既有证书快照不变，跨规则版本的修订影响报告分别依两张
-     证书快照重建时间线并给出四项规则前后值。
+     证书快照重建时间线并给出四项规则前后值；
+  8) 证书撤销：证书标识 + 非空原因撤销（只改有效性，版本/结论/快照不变）、
+     同原因重放幂等返回原记录、异因 409、空白原因 422、不存在 404、
+     查询撤销时间与原因、当前可用证书（撤销最新版不退回旧版）、
+     重签沿用递增版本并成为当前可用证书、报告标示撤销状态。
 """
 from __future__ import annotations
 
@@ -405,6 +409,71 @@ def main() -> None:
     assert all(c["before"]["status"] == "normal" for c in rep["timeline"]["changes"])
     assert all(c["after"]["status"] == "exceeded" for c in rep["timeline"]["changes"])
     print("汇总结论：", rep["summary"]["conclusion_zh"])
+
+    # ---------- 证书撤销（依据有误） ----------
+    show("证书撤销：非空原因；只改有效性；同因幂等/异因 409；不退回旧版、重签递增")
+    rw = create_window("展柜G-证书撤销", 20, max_exceed=300, max_gap=600)
+    for rid, m in [("a", 0), ("b", 10), ("z", 20)]:
+        assert submit(rw, rid, 1, m, 20.0)[0] == 201
+    v1 = call("POST", f"/api/v1/windows/{rw}/certificates/issue",
+              {"note": "首签"})[1]
+    cur = call("GET", f"/api/v1/windows/{rw}/current-certificate")[1]
+    assert cur["available"] and cur["certificate"]["id"] == v1["id"]
+    print("当前可用证书: v" + str(cur["certificate"]["version"]))
+
+    # 撤销：版本/结论/快照不变，新增撤销时间与原因
+    code, r = call("POST", f"/api/v1/certificates/{v1['id']}/revoke",
+                   {"reason": "依据有误：读数来源仪器未校准"})
+    rev = r["revocation"]
+    print("撤销:", code, r["effect"], "version/verdict 保持:",
+          r["certificate"]["version"], r["certificate"]["verdict"],
+          "revoked:", r["certificate"]["revoked"])
+    assert code == 201 and r["effect"] == "revoked"
+    assert r["certificate"]["snapshot"] == v1["snapshot"]
+    assert rev["reason"] == "依据有误：读数来源仪器未校准" and rev["revoked_at"]
+
+    # 相同原因重放 -> 幂等返回原记录（不产生新事件）；原因不同 -> 409；
+    # 空白原因 -> 422；证书不存在 -> 404
+    code, r = call("POST", f"/api/v1/certificates/{v1['id']}/revoke",
+                   {"reason": "依据有误：读数来源仪器未校准"})
+    assert code == 201 and r["effect"] == "idempotent"
+    assert r["revocation"] == rev
+    print("同原因重放:", code, r["effect"], "（撤销时间不变）")
+    assert call("POST", f"/api/v1/certificates/{v1['id']}/revoke",
+                {"reason": "别的原因"})[0] == 409
+    assert call("POST", f"/api/v1/certificates/{v1['id']}/revoke",
+                {"reason": "   "})[0] == 422
+    assert call("POST", "/api/v1/certificates/999999/revoke",
+                {"reason": "x"})[0] == 404
+    print("异因 409 / 空白原因 422 / 不存在 404（原撤销记录不变）")
+
+    # 查询撤销时间与原因；撤销后无当前可用证书（latest_revoked，不退回旧版）
+    got = call("GET", f"/api/v1/certificates/{v1['id']}/revocation")[1]
+    assert got["revoked"] and got["revocation"]["revoked_at"] == rev["revoked_at"]
+    cur = call("GET", f"/api/v1/windows/{rw}/current-certificate")[1]
+    print("撤销后当前可用:", cur["available"], cur["reason"])
+    assert cur == {"window_id": rw, "available": False,
+                   "reason": "latest_revoked", "certificate": None}
+
+    # 再次签发：版本递增为 2 并成为当前可用证书；历史列表标示撤销状态
+    v2 = call("POST", f"/api/v1/windows/{rw}/certificates/issue",
+              {"note": "撤销后重签"})[1]
+    assert v2["version"] == 2 and v2["revoked"] is False
+    cur = call("GET", f"/api/v1/windows/{rw}/current-certificate")[1]
+    assert cur["available"] and cur["certificate"]["id"] == v2["id"]
+    print("重签后当前可用: v" + str(v2["version"]))
+    lst = call("GET", f"/api/v1/windows/{rw}/certificates")[1]
+    print("历史证书撤销标示:", [(c["version"], c["status"]) for c in lst])
+    assert [(c["version"], c["revoked"]) for c in lst] == [(1, True), (2, False)]
+
+    # 修订影响报告仍可读取已撤销证书并标示撤销状态（比对仍只取自快照）
+    rep = call("GET", f"/api/v1/certificates/revision-report"
+                      f"?old_certificate_id={v1['id']}&new_certificate_id={v2['id']}")[1]
+    assert rep["old_certificate"]["revoked"] is True
+    assert rep["old_certificate"]["revocation"]["reason"] == rev["reason"]
+    assert rep["new_certificate"]["revoked"] is False
+    print("报告两证撤销状态: old =", rep["old_certificate"]["status"],
+          ", new =", rep["new_certificate"]["status"])
 
     print("\n全部示例执行完成 ✔")
 

@@ -258,3 +258,59 @@ OLD_RC=$(echo "$RC1" | python3 -c "import sys,json;print(json.load(sys.stdin)['i
 NEW_RC=$(echo "$RC2" | python3 -c "import sys,json;print(json.load(sys.stdin)['id'])")
 api GET "/api/v1/certificates/revision-report?old_certificate_id=$OLD_RC&new_certificate_id=$NEW_RC" \
   | python3 -c "import sys,json;d=json.load(sys.stdin);print('rules_diff:',d['rules_diff']['rule_revision_before'],'->',d['rules_diff']['rule_revision_after'],d['rules_diff']['changed_fields']);print('timeline_change_count:',d['timeline']['change_count']);print(d['summary']['conclusion_zh'])"
+
+# ================================================================
+# 16. 证书撤销（依据有误）
+# ================================================================
+echo "-- 16.1 新建窗口与读数并首签 --"
+RVW=$(api POST /api/v1/windows '{
+  "name": "展柜撤销示例",
+  "start_at": "2026-12-01T00:00:00Z",
+  "end_at":   "2026-12-01T00:20:00Z",
+  "allowed_temp_min": 18.0,
+  "allowed_temp_max": 22.0,
+  "max_continuous_exceed_seconds": 300,
+  "max_sample_interval_seconds": 600
+}')
+RVID=$(echo "$RVW" | python3 -c "import sys,json;print(json.load(sys.stdin)['id'])")
+for mt in 00 10 20; do
+  api POST "/api/v1/windows/$RVID/readings" \
+    "{\"reading_id\":\"v-$mt\",\"revision\":1,\"measured_at\":\"2026-12-01T00:$mt:00Z\",\"temperature\":20.0}" >/dev/null
+done
+V1=$(api POST "/api/v1/windows/$RVID/certificates/issue" '{"note":"首签"}')
+V1_ID=$(echo "$V1" | python3 -c "import sys,json;print(json.load(sys.stdin)['id'])")
+echo "首签证书：id=$V1_ID"
+api GET "/api/v1/windows/$RVID/current-certificate" \
+  | python3 -c "import sys,json;d=json.load(sys.stdin);print('当前可用:',d['available'],'证书',d['certificate'] and d['certificate']['id'])"
+
+echo "-- 16.2 撤销（非空原因）：只改有效性，版本/结论/快照不变 --"
+api POST "/api/v1/certificates/$V1_ID/revoke" '{"reason":"依据有误：读数来源仪器未校准"}' \
+  | python3 -c "import sys,json;d=json.load(sys.stdin);print('effect:',d['effect']);print('撤销记录:',d['revocation']);print('证书 version/verdict 不变:',d['certificate']['version'],d['certificate']['verdict'],'revoked:',d['certificate']['revoked'],d['certificate']['status'])"
+
+echo "-- 16.3 相同原因重复撤销 -> 幂等返回原记录（revoked_at 不变，不产生新事件）--"
+api POST "/api/v1/certificates/$V1_ID/revoke" '{"reason":"依据有误：读数来源仪器未校准"}' \
+  | python3 -c "import sys,json;print('effect:',json.load(sys.stdin)['effect'])"
+
+echo "-- 16.4 拒绝路径：原因不同 409 / 空白原因 422 / 证书不存在 404 --"
+api POST "/api/v1/certificates/$V1_ID/revoke" '{"reason":"换成别的原因"}' || true
+api POST "/api/v1/certificates/$V1_ID/revoke" '{"reason":"   "}' || true
+api POST /api/v1/certificates/999999/revoke '{"reason":"证书不存在"}' || true
+
+echo "-- 16.5 查询撤销时间与原因；撤销后窗口无当前可用证书（不退回旧版）--"
+api GET "/api/v1/certificates/$V1_ID/revocation" \
+  | python3 -c "import sys,json;d=json.load(sys.stdin);print('revoked:',d['revoked'],'reason:',d['revocation']['reason'],'at:',d['revocation']['revoked_at'])"
+api GET "/api/v1/windows/$RVID/current-certificate" \
+  | python3 -c "import sys,json;d=json.load(sys.stdin);print('当前可用:',d['available'],'reason:',d['reason'])"
+
+echo "-- 16.6 再次签发：版本递增为 v2 并成为当前可用证书；历史列表标示撤销状态 --"
+V2=$(api POST "/api/v1/windows/$RVID/certificates/issue" '{"note":"撤销后重签"}')
+echo "$V2" | python3 -c "import sys,json;c=json.load(sys.stdin);print('重签版本:',c['version'],'revoked:',c['revoked'])"
+api GET "/api/v1/windows/$RVID/current-certificate" \
+  | python3 -c "import sys,json;d=json.load(sys.stdin);print('当前可用:',d['available'],'version:',d['certificate']['version'])"
+api GET "/api/v1/windows/$RVID/certificates" \
+  | python3 -c "import sys,json;[print('v%s revoked=%s reason=%s'%(c['version'],c['revoked'],c['revocation'] and c['revocation']['reason'])) for c in json.load(sys.stdin)]"
+
+echo "-- 16.7 两证修订影响报告仍可读取已撤销证书并标示撤销状态（比对仍只取自快照）--"
+V2_ID=$(echo "$V2" | python3 -c "import sys,json;print(json.load(sys.stdin)['id'])")
+api GET "/api/v1/certificates/revision-report?old_certificate_id=$V1_ID&new_certificate_id=$V2_ID" \
+  | python3 -c "import sys,json;d=json.load(sys.stdin);print('old revoked:',d['old_certificate']['revoked'],d['old_certificate']['revocation']['reason']);print('new revoked:',d['new_certificate']['revoked'])"
