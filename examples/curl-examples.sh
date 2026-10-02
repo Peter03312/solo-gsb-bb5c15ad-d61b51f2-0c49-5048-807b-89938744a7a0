@@ -258,3 +258,62 @@ OLD_RC=$(echo "$RC1" | python3 -c "import sys,json;print(json.load(sys.stdin)['i
 NEW_RC=$(echo "$RC2" | python3 -c "import sys,json;print(json.load(sys.stdin)['id'])")
 api GET "/api/v1/certificates/revision-report?old_certificate_id=$OLD_RC&new_certificate_id=$NEW_RC" \
   | python3 -c "import sys,json;d=json.load(sys.stdin);print('rules_diff:',d['rules_diff']['rule_revision_before'],'->',d['rules_diff']['rule_revision_after'],d['rules_diff']['changed_fields']);print('timeline_change_count:',d['timeline']['change_count']);print(d['summary']['conclusion_zh'])"
+
+echo "== 16. 已签发证书撤销（单独建窗口演示；撤销只改有效性，版本/结论/快照不动）=="
+VW=$(api POST /api/v1/windows '{
+  "name": "展柜G-证书撤销",
+  "start_at": "2026-10-01T00:00:00Z",
+  "end_at":   "2026-10-01T00:05:00Z",
+  "allowed_temp_min": 18.0,
+  "allowed_temp_max": 22.0,
+  "max_continuous_exceed_seconds": 300,
+  "max_sample_interval_seconds": 120
+}')
+VID=$(echo "$VW" | python3 -c "import sys,json;print(json.load(sys.stdin)['id'])")
+for m in 0 1 2 3 4 5; do
+  api POST "/api/v1/windows/$VID/readings" \
+    "{\"reading_id\":\"r-$m\",\"revision\":1,\"measured_at\":\"2026-10-01T00:0$m:00Z\",\"temperature\":20.0}" >/dev/null
+done
+echo "-- 16.1 尚无证书时查询当前可用证书 -> 409 --"
+api GET "/api/v1/windows/$VID/certificates/current" || true
+
+echo "-- 16.2 连续签发 v1、v2（v2 为当前可用证书）--"
+VC1=$(api POST "/api/v1/windows/$VID/certificates/issue" '{"note":"v1"}')
+VC2=$(api POST "/api/v1/windows/$VID/certificates/issue" '{"note":"v2"}')
+V1=$(echo "$VC1" | python3 -c "import sys,json;print(json.load(sys.stdin)['id'])")
+V2=$(echo "$VC2" | python3 -c "import sys,json;print(json.load(sys.stdin)['id'])")
+api GET "/api/v1/windows/$VID/certificates/current" \
+  | python3 -c "import sys,json;c=json.load(sys.stdin);print('当前可用: 证书',c['id'],'version',c['version'])"
+
+echo "-- 16.3 撤销旧版 v1（非空原因）：不影响当前可用（仍是 v2）；v1 版本/结论/快照不变 --"
+api POST "/api/v1/certificates/$V1/revocation" '{"reason":"签发依据有误：r-2 为误采"}' \
+  | python3 -c "import sys,json;d=json.load(sys.stdin);print('effect:',d['effect']);print('v1 revoked:',d['certificate']['revoked'],'version/verdict:',d['certificate']['version'],d['certificate']['verdict'],'快照读数:',len(d['certificate']['snapshot']['readings']));print('revocation:',d['certificate']['revocation']);print('current_certificate:',d['current_certificate']['id'],'v'+str(d['current_certificate']['version']))"
+
+echo "-- 16.4 相同原因重复撤销 v1 -> 幂等（返回原记录，撤销时间不变，不产生新事件）--"
+api POST "/api/v1/certificates/$V1/revocation" '{"reason":"签发依据有误：r-2 为误采"}' \
+  | python3 -c "import sys,json;print('effect:',json.load(sys.stdin)['effect'])"
+
+echo "-- 16.5 拒绝路径：不同原因 409 / 空白原因 422 / 证书不存在 404 --"
+api POST "/api/v1/certificates/$V1/revocation" '{"reason":"另一个原因"}' || true
+api POST "/api/v1/certificates/$V1/revocation" '{"reason":"   "}' || true
+api POST "/api/v1/certificates/99999/revocation" '{"reason":"x"}' || true
+
+echo "-- 16.6 撤销最新版 v2：不自动退回旧版（v1 仍有效但不是当前可用），当前可用为空 --"
+api POST "/api/v1/certificates/$V2/revocation" '{"reason":"v2 依据有误"}' >/dev/null
+api GET "/api/v1/windows/$VID/certificates/current" || true
+api GET "/api/v1/windows/$VID" \
+  | python3 -c "import sys,json;d=json.load(sys.stdin);print('latest_certificate_version:',d['latest_certificate_version'],'current_certificate_id:',d['current_certificate_id'])"
+
+echo "-- 16.7 历史仍可读并标示撤销状态：证书列表 + 按主键获取 --"
+api GET "/api/v1/windows/$VID/certificates" \
+  | python3 -c "import sys,json;[print('v'+str(c['version']),c['verdict'],'revoked=',c['revoked'],'reason=',c['revocation']['reason'] if c['revocation'] else None) for c in json.load(sys.stdin)]"
+
+echo "-- 16.8 两证修订影响报告仍可生成（只依快照），引用中带 revoked/revocation --"
+api GET "/api/v1/certificates/revision-report?old_certificate_id=$V1&new_certificate_id=$V2" \
+  | python3 -c "import sys,json;d=json.load(sys.stdin);print('old/new revoked:',d['old_certificate']['revoked'],d['new_certificate']['revoked']);print(d['summary']['verdict_before'],'->',d['summary']['verdict_after'])"
+
+echo "-- 16.9 再次签发：版本沿用递增（v3），成为当前可用证书 --"
+VC3=$(api POST "/api/v1/windows/$VID/certificates/issue" '{"note":"v3 重新签发"}')
+echo "$VC3" | python3 -c "import sys,json;c=json.load(sys.stdin);print('新证书',c['id'],'version',c['version'],'revoked',c['revoked'])"
+api GET "/api/v1/windows/$VID/certificates/current" \
+  | python3 -c "import sys,json;c=json.load(sys.stdin);print('当前可用: 证书',c['id'],'version',c['version'])"

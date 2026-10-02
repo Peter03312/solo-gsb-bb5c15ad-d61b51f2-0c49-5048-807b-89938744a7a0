@@ -120,6 +120,36 @@ class IssueRequest(BaseModel):
     note: Optional[str] = Field(None, max_length=500, description="签发备注")
 
 
+# ------------------------------------------------------------ 证书撤销
+
+class CertificateRevokeSubmit(BaseModel):
+    """撤销已签发证书：非空原因（证书标识在路径中给出）。
+
+    - 撤销只改变证书有效性：记录撤销原因与撤销时间，证书的版本、结论与
+      不可变快照均不改动，历史证书仍可查询/列表/生成修订影响报告；
+    - 同一证书以相同原因重复撤销 -> 幂等，返回原撤销记录且不产生新事件；
+    - 已撤销证书以不同原因再次撤销 -> 409；原因为空或只含空白 -> 422；
+    - 证书不存在 -> 404。
+    """
+
+    reason: str = Field(..., min_length=1, max_length=500,
+                        description="撤销原因（非空，不能只含空白字符）")
+
+    @field_validator("reason")
+    @classmethod
+    def _non_blank(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("撤销原因不能为空（不能只含空白字符）")
+        return v
+
+
+class RevocationInfoOut(BaseModel):
+    """撤销信息：证书有效（未撤销）时为 null。"""
+
+    reason: str = Field(..., description="撤销原因")
+    revoked_at: str = Field(..., description="撤销操作时间（UTC）")
+
+
 # ------------------------------------------------------------ 规则修订
 
 class RuleValuesOut(BaseModel):
@@ -234,8 +264,17 @@ class WindowOut(BaseModel):
     created_at: str
     current_evaluation: Optional[EvaluationOut] = None
     active_readings: list[ReadingOut] = []
-    latest_certificate_version: Optional[int] = None
-    latest_verdict: Optional[str] = None
+    latest_certificate_version: Optional[int] = Field(
+        None, description="最新签发版本号（不论是否撤销；无证书为 null）")
+    latest_verdict: Optional[str] = Field(
+        None, description="最新签发版本的结论（不论是否撤销）")
+    current_certificate_id: Optional[int] = Field(
+        None, description="当前可用证书主键：仅最新签发版本未撤销时存在，否则为 null")
+    current_certificate_version: Optional[int] = Field(
+        None, description="当前可用证书版本；撤销最新版不自动退回旧版，故可能为 null")
+    current_verdict: Optional[str] = Field(None, description="当前可用证书结论；无则为 null")
+    current_certificate: Optional["CertificateOut"] = Field(
+        None, description="窗口详情中给出的当前可用证书完整内容（列表端点不返回）；无则为 null")
 
 
 class ReadingSubmitResponse(BaseModel):
@@ -308,7 +347,17 @@ class CertificateOut(BaseModel):
     verdict_label_zh: str
     issued_at: str
     note: Optional[str]
+    revoked: bool = Field(False, description="是否已撤销（撤销只改变有效性，版本/结论/快照不变）")
+    revocation: Optional[RevocationInfoOut] = Field(
+        None, description="撤销信息（原因与撤销时间）；未撤销为 null")
     snapshot: dict[str, Any]
+
+
+class CertificateRevokeResponse(BaseModel):
+    effect: str = Field(..., description="revoked | idempotent")
+    certificate: CertificateOut = Field(..., description="撤销后的证书（含撤销信息；快照原样）")
+    current_certificate: Optional[CertificateOut] = Field(
+        None, description="该窗口当前可用证书：仅最新签发版本未撤销时存在，否则为 null")
 
 
 # ------------------------------------------------------------ 修订影响报告
@@ -389,6 +438,8 @@ class ReportCertificateRef(BaseModel):
     verdict_label_zh: str
     issued_at: str
     note: Optional[str]
+    revoked: bool = False
+    revocation: Optional[RevocationInfoOut] = None
 
 
 class ReportSummary(BaseModel):
@@ -418,3 +469,8 @@ class RevisionReportOut(BaseModel):
 
 class ErrorBody(BaseModel):
     detail: str
+
+
+# WindowOut.current_certificate 前向引用了后文定义的 CertificateOut，
+# 全部模型定义完成后重建一次以解析该引用。
+WindowOut.model_rebuild()

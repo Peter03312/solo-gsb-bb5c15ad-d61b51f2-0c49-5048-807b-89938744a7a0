@@ -478,6 +478,9 @@ def build_revision_report(old_cert: dict[str, Any],
             "verdict_label_zh": c["verdict_label_zh"],
             "issued_at": c["issued_at"],
             "note": c.get("note"),
+            # 撤销状态随证书元数据标示；报告比对内容仍只依不可变快照
+            "revoked": bool(c.get("revoked")),
+            "revocation": c.get("revocation"),
         }
 
     return {

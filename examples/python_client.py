@@ -17,7 +17,12 @@
   7) 窗口规则版本化修订：初始规则第 1 版、连续修订号（当前版+1）生效、
      同号同值同原因幂等/冲突 409、旧号与跳号 409、非法输入 422、
      立即重算、既有证书快照不变，跨规则版本的修订影响报告分别依两张
-     证书快照重建时间线并给出四项规则前后值。
+     证书快照重建时间线并给出四项规则前后值；
+  8) 已签发证书撤销：凭证书标识 + 非空原因撤销，只改有效性（版本/结论/
+     快照不变）；同原因重放幂等、异因 409、空因 422、不存在 404；
+     历史证书（查询/列表/修订影响报告）仍可读并标示撤销状态；
+     仅最新签发版本未撤销时窗口有当前可用证书，撤销最新版不退回旧版，
+     再次签发沿用递增版本并成为当前可用证书。
 """
 from __future__ import annotations
 
@@ -98,6 +103,14 @@ def revise_rules(wid, rev, *, tmin=18.0, tmax=22.0, max_exceed=300.0, max_gap=60
         "max_sample_interval_seconds": max_gap,
         "reason": reason,
     })
+
+
+def revoke_cert(cid, reason):
+    return call("POST", f"/api/v1/certificates/{cid}/revocation", {"reason": reason})
+
+
+def current_certificate(wid):
+    return call("GET", f"/api/v1/windows/{wid}/certificates/current")
 
 
 def item(rid, rev, minute, temp):
@@ -405,6 +418,79 @@ def main() -> None:
     assert all(c["before"]["status"] == "normal" for c in rep["timeline"]["changes"])
     assert all(c["after"]["status"] == "exceeded" for c in rep["timeline"]["changes"])
     print("汇总结论：", rep["summary"]["conclusion_zh"])
+
+    # ---------- 已签发证书撤销 ----------
+    show("证书撤销：只改有效性；同因幂等/异因 409/空因 422；当前可用随版本")
+    wx = create_window("展柜G-证书撤销", 5, max_exceed=300, max_gap=120)
+    for m in range(6):
+        assert submit(wx, f"r{m}", 1, m, 20.0)[0] == 201
+    assert call("GET", f"/api/v1/windows/{wx}/evaluation")[1]["verdict"] == "pass"
+
+    # 尚无证书 -> 当前可用查询 409
+    assert current_certificate(wx)[0] == 409
+    x1 = call("POST", f"/api/v1/windows/{wx}/certificates/issue", {"note": "v1"})[1]
+    x2 = call("POST", f"/api/v1/windows/{wx}/certificates/issue", {"note": "v2"})[1]
+    assert x1["version"] == 1 and x2["version"] == 2
+    cur = current_certificate(wx)[1]
+    print("当前可用: v", cur["version"], "(证书", cur["id"], ") revoked =", cur["revoked"])
+    assert cur["id"] == x2["id"]
+
+    # 撤销旧版 v1：非空原因；版本/结论/快照不变，不影响当前可用（仍 v2）
+    code, r = revoke_cert(x1["id"], "签发依据有误：r2 为误采")
+    c1_after = r["certificate"]
+    print("撤销 v1:", code, r["effect"], "revoked =", c1_after["revoked"],
+          "version/verdict 不变:", c1_after["version"], c1_after["verdict"],
+          "快照读数数:", len(c1_after["snapshot"]["readings"]))
+    print("  撤销信息:", c1_after["revocation"])
+    print("  响应中的当前可用: v", r["current_certificate"]["version"])
+    assert code == 201 and r["effect"] == "revoked"
+    assert c1_after["snapshot"] == x1["snapshot"]
+    assert r["current_certificate"]["id"] == x2["id"]
+
+    # 相同原因重复撤销 -> 幂等，返回原记录（撤销时间不变），不产生新版本
+    code, r = revoke_cert(x1["id"], "签发依据有误：r2 为误采")
+    print("同因重放:", code, r["effect"], "撤销时间不变:",
+          r["certificate"]["revocation"]["revoked_at"] == c1_after["revocation"]["revoked_at"])
+    assert code == 201 and r["effect"] == "idempotent"
+    assert r["certificate"]["revocation"] == c1_after["revocation"]
+    # 不同原因 409 / 空白原因 422 / 证书不存在 404
+    assert revoke_cert(x1["id"], "另一个原因")[0] == 409
+    assert revoke_cert(x1["id"], "   ")[0] == 422
+    assert revoke_cert(99999, "x")[0] == 404
+    print("拒绝路径：异因 409、空因 422、不存在 404（均不改动证书）")
+
+    # 历史仍可读并标示撤销状态：版本列表 + 按主键获取
+    certs = call("GET", f"/api/v1/windows/{wx}/certificates")[1]
+    print("版本列表:", [(c["version"], c["revoked"], c["revocation"] and
+                        c["revocation"]["reason"]) for c in certs])
+    assert [(c["version"], c["revoked"]) for c in certs] == [(1, True), (2, False)]
+
+    # 撤销最新版 v2：不自动退回旧版，当前可用为空（409）
+    assert revoke_cert(x2["id"], "v2 依据有误")[0] == 201
+    code, _ = current_certificate(wx)
+    print("撤销最新版后当前可用查询:", code, "（旧版 v1 不自动恢复为当前）")
+    assert code == 409
+    detail = call("GET", f"/api/v1/windows/{wx}")[1]
+    assert detail["latest_certificate_version"] == 2
+    assert detail["current_certificate"] is None
+
+    # 修订影响报告对两证（均撤销）仍可生成，只依快照，引用带 revoked 标示
+    rep = call("GET", f"/api/v1/certificates/revision-report"
+                      f"?old_certificate_id={x1['id']}&new_certificate_id={x2['id']}")[1]
+    print("两证撤销后报告: old revoked =", rep["old_certificate"]["revoked"],
+          "new revoked =", rep["new_certificate"]["revoked"],
+          "结论:", rep["summary"]["verdict_before"], "->", rep["summary"]["verdict_after"])
+    assert rep["old_certificate"]["revoked"] and rep["new_certificate"]["revoked"]
+
+    # 再次签发：版本沿用递增到 v3，成为当前可用证书
+    x3 = call("POST", f"/api/v1/windows/{wx}/certificates/issue",
+              {"note": "v3 重新签发"})[1]
+    cur = current_certificate(wx)[1]
+    print("再签发: v", x3["version"], "；当前可用 v", cur["version"],
+          "(证书", cur["id"], ")")
+    assert x3["version"] == 3 and cur["id"] == x3["id"] and cur["revoked"] is False
+    old1 = call("GET", f"/api/v1/certificates/{x1['id']}")[1]
+    assert old1["version"] == 1 and old1["revoked"] is True
 
     print("\n全部示例执行完成 ✔")
 

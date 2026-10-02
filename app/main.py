@@ -5,13 +5,15 @@ import sqlite3
 from contextlib import asynccontextmanager
 from typing import Any, Optional
 
-from fastapi import Depends, FastAPI, Query, status
+from fastapi import Depends, FastAPI, HTTPException, Query, status
 
 from . import services
 from .database import connect, get_conn, init_db, write_transaction
 from .models import VERDICT_LABELS_ZH, Verdict
 from .schemas import (
     CertificateOut,
+    CertificateRevokeResponse,
+    CertificateRevokeSubmit,
     EvaluationOut,
     IssueRequest,
     ReadingBatchSubmit,
@@ -44,13 +46,14 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="博物馆展柜温度暴露审定服务",
-    version="1.4.0",
+    version="1.5.0",
     description=(
         "对展柜在给定审定窗口内的温度读数进行暴露审定："
         "输出正常/超限/未知区段与最长连续超限时长，"
         "支持读数修订、幂等提交（单条与批量补传）、误采作废与恢复、"
         "窗口规则版本化修订（初始规则为第 1 版，连续修订号 + 非空原因）、"
-        "证书版本化签发，"
+        "证书版本化签发与已签发证书撤销（凭非空原因，只改有效性、快照不变；"
+        "仅最新签发版本未撤销时窗口有当前可用证书），"
         "并可对同一窗口两张已签发证书的不可变快照生成修订影响报告"
         "（跨规则版本时分别依两证快照重建时间线并给出四项规则前后值）。"
     ),
@@ -291,6 +294,29 @@ def list_certificates(
     return services.list_certificates(conn, window_id)
 
 
+@app.get("/api/v1/windows/{window_id}/certificates/current",
+         response_model=CertificateOut, tags=["certificates"])
+def get_current_certificate(
+    window_id: int, conn: sqlite3.Connection = Depends(get_conn)
+) -> dict[str, Any]:
+    """窗口当前可用证书：仅最新签发版本未撤销时存在。
+
+    撤销最新版后不自动退回旧版（此时 409）；再次签发沿用递增版本号，
+    新版本未撤销即成为当前可用证书。窗口不存在返回 404。
+    """
+    services.get_window_row(conn, window_id)
+    row = services.get_current_certificate_row(conn, window_id)
+    if row is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"窗口 {window_id} 当前没有可用证书：尚无证书，或最新签发版本已撤销"
+                "（撤销不自动退回旧版；再次签发后新版本即成为当前可用证书）。"
+            ),
+        )
+    return services.certificate_to_dict(row)
+
+
 # 注意：本静态路径必须注册在 /api/v1/certificates/{certificate_id} 之前，
 # 否则 "revision-report" 会先被 {certificate_id:int} 匹配并触发 422。
 @app.get("/api/v1/certificates/revision-report",
@@ -312,6 +338,38 @@ def get_revision_report(
     两 ID 相同均返回 422；证书不存在返回 404。
     """
     return services.revision_report(conn, old_certificate_id, new_certificate_id)
+
+
+@app.post(
+    "/api/v1/certificates/{certificate_id}/revocation",
+    response_model=CertificateRevokeResponse,
+    status_code=status.HTTP_201_CREATED,
+    tags=["certificates"],
+)
+def revoke_certificate(
+    certificate_id: int,
+    payload: CertificateRevokeSubmit,
+    conn: sqlite3.Connection = Depends(get_conn),
+) -> dict[str, Any]:
+    """馆员撤销一张已签发证书（发现签发依据有误时）。
+
+    凭证书标识（路径）与非空原因撤销：
+    - 撤销只改变有效性：记录撤销原因与撤销时间，证书的版本、结论与不可变
+      快照均不改动；历史证书仍可经证书查询/版本列表/修订影响报告读取，
+      并以 revoked/revocation 标示撤销状态；
+    - 同一证书以**相同原因**重复撤销 -> effect=idempotent，返回原撤销记录
+      （撤销时间不变），不产生新事件；已撤销证书以**不同原因**撤销 -> 409；
+    - 原因为空或只含空白 -> 422；证书不存在 -> 404；
+    - 响应 current_certificate 给出窗口当前可用证书：仅最新签发版本未撤销时
+      存在（撤销最新版不自动退回旧版），否则为 null；
+    - 撤销与签发在 BEGIN IMMEDIATE 下串行，结果符合实际提交顺序。
+    """
+    # BEGIN IMMEDIATE：与签发并发时按事务提交顺序确定“最新版本/当前可用”。
+    with write_transaction(conn):
+        effect, certificate, current = services.revoke_certificate(
+            conn, certificate_id, payload)
+        return {"effect": effect, "certificate": certificate,
+                "current_certificate": current}
 
 
 @app.get("/api/v1/certificates/{certificate_id}", response_model=CertificateOut,

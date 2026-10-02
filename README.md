@@ -5,7 +5,10 @@
 区段，计算**最长连续超限时长**，并给出审定结论；支持读数幂等提交、修订替换、
 **采样仪器按审定窗口批量补传（整批事务、互换时刻、重放不产生新修订）**、
 **误采作废与恢复（作废留存修订：原因/操作时间/前一版本；更高修订号恢复）**、
-证书版本化签发（快照不可变），支持馆员对窗口四项审定规则做
+证书版本化签发（快照不可变）与**已签发证书撤销**（馆员发现签发依据有误时，
+凭证书标识 + 非空原因撤销；撤销只改有效性，版本/结论/快照原样保留，
+仅最新签发版本未撤销时窗口有当前可用证书，撤销最新版不自动退回旧版），
+支持馆员对窗口四项审定规则做
 **版本化修订**（初始规则为第 1 版，连续修订号 + 非空原因，立即重算、
 既有证书快照不变），并可对同一审定窗口的两张已签发证书生成
 **修订影响报告**（只读快照比对：规则四项前后值、读数新增/变更/移除、
@@ -157,6 +160,39 @@
   签发（读）与修订（写）并发时，以事务为边界取同一已提交状态——
   修订先提交则纳入本次签发，否则等签发完成后再生效，不会出现脏读或快照撕裂。
 
+### 已签发证书撤销
+
+馆员发现已签发证书的**签发依据有误**时，
+`POST /api/v1/certificates/{id}/revocation` 凭**证书标识（路径主键）与非空原因**
+撤销该证书（请求体 `{"reason": "..."}`）：
+
+- **只改变有效性**：写入撤销原因（`revocation.reason`）与撤销时间
+  （`revocation.revoked_at`，UTC），并以顶层 `revoked: true` 标示；
+  原证书的 **`version`、`verdict`（结论）与不可变 `snapshot` 均不改动**。
+- **历史仍可读**：`GET /api/v1/certificates/{id}`、窗口证书版本列表
+  `GET /api/v1/windows/{id}/certificates` 以及两证修订影响报告都仍返回
+  历史证书，并带 `revoked` / `revocation` 标示（报告的比对内容仍只依两证
+  各自快照；两证引用对象新增撤销状态字段）。
+- **当前可用证书**：一个窗口**只有最新签发版本未撤销**时才有当前可用证书：
+  - 查询：窗口详情 `GET /api/v1/windows/{id}`（`current_certificate` 完整对象，
+    以及 `current_certificate_id` / `current_certificate_version` / `current_verdict`
+    标量；列表端点只给标量），或 `GET /api/v1/windows/{id}/certificates/current`
+    （无当前可用证书时 **409**，窗口不存在 **404**）。
+  - 撤销**最新版**后**不自动退回旧版**——即使旧版仍有效，窗口也暂时没有
+    当前可用证书；**再次签发沿用递增版本号**（接着已用版本号继续 +1），
+    新版本未撤销即成为当前可用证书。
+  - 撤销**旧版本**不影响当前可用（当前仍是最新未撤销版本）。撤销响应的
+    `current_certificate` 字段直接给出撤销后窗口的当前可用证书（可能为 `null`）。
+- **幂等与冲突**：
+  - 同一证书以**相同原因**重复撤销 → 幂等（`effect: idempotent`），返回**原
+    撤销记录**（撤销时间不变），**不产生新事件/新版本**；
+  - 已撤销证书以**不同原因**再次撤销 → **409 原因冲突**；
+  - 原因为空或只含空白（或缺字段）→ **422**；
+  - 证书不存在 → **404**。
+- **并发**：撤销与签发同在 `BEGIN IMMEDIATE` 写事务内串行，二者结果严格
+  符合**实际提交顺序**：撤销先提交则新版本成为当前可用；签发先提交则其成为
+  当前可用、随后的撤销只作用于被指定的那张证书。
+
 ---
 
 ## 2. 启动
@@ -216,8 +252,9 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 |---|---|---|
 | `POST` | `/api/v1/windows` | 创建审定窗口（窗口倒置/温度区间倒置返回 422）；初始规则自动记为第 1 版 |
 | `GET` | `/api/v1/windows?limit=&offset=` | 窗口列表（分页） |
-| `GET` | `/api/v1/windows/{id}` | 窗口详情：当前规则修订号 + 活动读数 + 当前审定 + 最新证书 |
+| `GET` | `/api/v1/windows/{id}` | 窗口详情：当前规则修订号 + 活动读数 + 当前审定 + 最新证书 + 当前可用证书 |
 | `GET` | `/api/v1/windows/{id}/evaluation` | 只看当前审定结果 |
+| `GET` | `/api/v1/windows/{id}/certificates/current` | 窗口当前可用证书：仅最新签发版本未撤销时存在（无则 409；窗口不存在 404；撤销最新版不自动退回旧版） |
 | `POST` | `/api/v1/windows/{id}/rule-revisions` | 规则版本化修订：目标修订号（当前版+1 生效）+ 四项完整新值 + 非空原因，响应含立即重算结果；同号同值同原因重放幂等 |
 | `GET` | `/api/v1/windows/{id}/rule-revisions` | 该窗口全部规则修订历史（第 1 版为初始规则，升序） |
 
@@ -307,14 +344,47 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| `POST` | `/api/v1/windows/{id}/certificates/issue` | 签发（可带 `{"note":"..."}`，也可空 body） |
-| `GET` | `/api/v1/windows/{id}/certificates` | 该窗口全部证书版本（按版本升序） |
-| `GET` | `/api/v1/certificates/{id}` | 按证书主键获取，`snapshot` 为签发时不可变快照 |
-| `GET` | `/api/v1/certificates/revision-report?old_certificate_id=&new_certificate_id=` | 对同一窗口两张已签发证书生成修订影响报告 |
+| `POST` | `/api/v1/windows/{id}/certificates/issue` | 签发（可带 `{"note":"..."}`，也可空 body）；版本递增，撤销后再签发沿用递增版本号 |
+| `GET` | `/api/v1/windows/{id}/certificates` | 该窗口全部证书版本（按版本升序），含每证 `revoked`/`revocation` 撤销标示 |
+| `POST` | `/api/v1/certificates/{id}/revocation` | 撤销已签发证书（body `{"reason":"非空原因"}`）：只改有效性，版本/结论/快照不变；同因重放幂等返回原记录，异因 409，空因 422，不存在 404；响应含撤销后窗口当前可用证书 |
+| `GET` | `/api/v1/certificates/{id}` | 按证书主键获取（不存在 404），`snapshot` 为签发时不可变快照，`revoked`/`revocation` 标示撤销状态 |
+| `GET` | `/api/v1/certificates/revision-report?old_certificate_id=&new_certificate_id=` | 对同一窗口两张已签发证书生成修订影响报告（证书即使已撤销也可比对；引用中带撤销标示，比对内容只依快照） |
 
 证书含 `id`、`window_id`、`version`、`verdict`、`verdict_label_zh`
-（合格/待定/不合格）、`issued_at`、`note`、`snapshot`。`snapshot.window`
-带签发时的规则修订号 `rule_revision`（规则版本化之前的旧证书按第 1 版解读）。
+（合格/待定/不合格）、`issued_at`、`note`、`revoked`（是否已撤销）、
+`revocation`（未撤销为 `null`；否则为 `{"reason": ..., "revoked_at": ...}`）、
+`snapshot`。`snapshot.window` 带签发时的规则修订号 `rule_revision`
+（规则版本化之前的旧证书按第 1 版解读）；撤销不修改快照内任何字段。
+
+撤销请求与响应：
+
+```json
+// 请求：POST /api/v1/certificates/3/revocation
+// {"reason": "签发依据有误：读数 r-02 事后确认为误采"}
+{
+  "effect": "revoked",
+  "certificate": {
+    "id": 3, "window_id": 1, "version": 2,
+    "verdict": "pass", "verdict_label_zh": "合格",
+    "issued_at": "2026-10-01T09:00:00.000Z", "note": "重签",
+    "revoked": true,
+    "revocation": {
+      "reason": "签发依据有误：读数 r-02 事后确认为误采",
+      "revoked_at": "2026-10-02T05:40:00.000Z"
+    },
+    "snapshot": { "window": {"rule_revision": 1, "...": "..."}, "...": "..." }
+  },
+  "current_certificate": null
+}
+```
+
+> `effect` 为 `revoked`（首次撤销）或 `idempotent`（同因重放，返回原记录）；
+> 撤销旧版本时 `current_certificate` 为最新未撤销版本；撤销最新版本后为 `null`
+> （不自动退回旧版）。窗口详情中与当前可用证书相关的字段：
+> `current_certificate`（详情完整对象；列表端点为 `null`）、
+> `current_certificate_id` / `current_certificate_version` / `current_verdict`，
+> 以及既有的 `latest_certificate_version` / `latest_verdict`（始终指向最新
+> **签发**版本，不论其是否撤销）。
 
 ### 修订影响报告
 
@@ -370,7 +440,9 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 - 报告是只读 GET，不改变任何既有内容；既有证书结构、查询响应与审定规则
   保持不变（仅新增端点与响应模型；报告新增 `rules_diff` 字段，
   `summary.conclusion_zh` 增加一行规则版本说明，证书快照 `window`
-  新增 `rule_revision`，窗口响应新增 `rule_revision`，均为增量字段）。
+  新增 `rule_revision`，窗口响应新增 `rule_revision`，均为增量字段；
+  证书与报告证书引用后续新增 `revoked`/`revocation` 撤销标示、窗口响应新增
+  当前可用证书字段，同样为不破坏旧含义的增量字段）。
 
 报告响应示例（fail → pass 整改）：
 
@@ -424,16 +496,19 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 
 ### 错误约定
 
-- `404`：窗口/证书不存在（修订影响报告中任一证书缺失）；
+- `404`：窗口/证书不存在（修订影响报告中任一证书缺失、撤销目标证书不存在）；
   作废或查询修订历史时读数从未存在
 - `409`：同 ID+修订号内容冲突；旧修订号覆盖（单条与批量语义一致）；
   作废修订号原因冲突或不高于当前修订号；已作废读数再次以新修订号作废；
   以不高于作废修订号的提交尝试复活读数；
-  规则修订同号但四项值/原因不一致、旧号提交、跳号提交
+  规则修订同号但四项值/原因不一致、旧号提交、跳号提交；
+  **已撤销证书以不同原因再次撤销（原因冲突）；窗口当前没有可用证书时
+  查询当前可用证书（尚无证书，或最新签发版本已撤销且不自动退回旧版）**
 - `422`：无效窗口、窗口外读数、同刻不同读数（批量按最终状态判定）、
   批量请求为空批次/同批 `reading_id` 重复、缺时区/字段非法、
   作废原因为空或只含空白等；
   规则修订数值非有限、温度下限大于上限、时长非正、原因为空或只含空白；
+  **撤销原因为空或只含空白（或缺 `reason` 字段）**；
   修订影响报告的两证书相同、跨审定窗口、版本未按先后排列也返回 422
 
 > 批量补传中任一项命中 409/422，整批回滚，错误 `detail` 指出具体原因；
@@ -446,10 +521,10 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 服务启动后：
 
 ```bash
-# curl 全流程（创建窗口 → 提交/幂等/冲突/修订 → 审定 → 两次签发 → 修订影响报告 → 批量补传 → 误采作废与恢复 → 规则版本化修订与跨规则版本报告）
+# curl 全流程（创建窗口 → 提交/幂等/冲突/修订 → 审定 → 两次签发 → 修订影响报告 → 批量补传 → 误采作废与恢复 → 规则版本化修订与跨规则版本报告 → 已签发证书撤销）
 bash examples/curl-examples.sh
 
-# Python 全流程（仅标准库，演示三种结论、拒收、修订、版本快照、修订影响报告、批量补传、误采作废与恢复、规则版本化修订与跨规则版本报告）
+# Python 全流程（仅标准库，演示三种结论、拒收、修订、版本快照、修订影响报告、批量补传、误采作废与恢复、规则版本化修订与跨规则版本报告、已签发证书撤销与当前可用证书）
 python3 examples/python_client.py
 # 或指定地址：
 BASE_URL=http://127.0.0.1:8000 python3 examples/python_client.py
@@ -535,6 +610,32 @@ curl -sS http://localhost:8000/api/v1/windows/1/rule-revisions \
 curl -sS http://localhost:8000/api/v1/windows/1/rule-revisions
 ```
 
+已签发证书撤销最小示例（承接已有一张证书 `$CID`；撤销只改有效性，
+版本/结论/快照不变；同因重放幂等、异因 409、空因 422、不存在 404）：
+
+```bash
+# 撤销：证书标识（主键）+ 非空原因；响应含撤销后窗口当前可用证书
+curl -sS -X POST http://localhost:8000/api/v1/certificates/$CID/revocation \
+  -H 'Content-Type: application/json' \
+  -d '{"reason":"签发依据有误：读数 r-02 事后确认为误采"}'
+
+# 相同原因重放 -> effect=idempotent，返回原撤销记录（撤销时间不变，不产生新事件）
+# 不同原因 -> 409；{"reason":"  "}或缺字段 -> 422；证书不存在 -> 404
+
+# 查撤销状态：按主键获取（历史证书仍可读）
+curl -sS http://localhost:8000/api/v1/certificates/$CID
+# ... "revoked":true,
+#     "revocation":{"reason":"...","revoked_at":"2026-10-02T05:40:00.000Z"},
+#     "version"/"verdict"/"snapshot" 与撤销前完全一致
+
+# 窗口全部证书版本（均带 revoked/revocation 标示）
+curl -sS http://localhost:8000/api/v1/windows/1/certificates
+
+# 窗口当前可用证书：仅最新签发版本未撤销时存在；否则 409
+# （撤销最新版不自动退回旧版；再次签发沿用递增版本号并成为当前可用证书）
+curl -sS http://localhost:8000/api/v1/windows/1/certificates/current
+```
+
 ---
 
 ## 5. 测试
@@ -566,18 +667,25 @@ PYTHONPATH=. python -m pytest tests/ -q
   窗口 404、窗口起止与读数不变、旧证快照不变与后续签发采用新规则、
   跨规则版本报告分别依两证快照重建时间线并给出四项规则前后值、
   即使结论不变规则变化仍可见、旧库第 1 版回填幂等）。
+- `tests/test_revocation_api.py`：已签发证书撤销 HTTP 测试
+  （凭证书标识 + 非空原因撤销并返回撤销时间/原因与当前可用证书；
+  撤销只改有效性不改版本/结论/快照；证书查询、版本列表、窗口详情、
+  修订影响报告仍可读历史证书并标示撤销状态；同因重放幂等返回原记录、
+  异因 409、空白原因 422、不存在 404；撤销最新版不退回旧版、撤销旧版
+  不影响当前；再签发沿用递增版本并成为当前；撤销/签发并发符合提交顺序；
+  旧库 ALTER 补列迁移且旧证书默认未撤销）。
 
 ## 6. 目录结构
 
 ```
 app/
   config.py        # 环境变量配置
-  database.py      # SQLite 连接、WAL、建表（含旧库补列迁移/规则第 1 版回填）、写事务（BEGIN IMMEDIATE）
+  database.py      # SQLite 连接、WAL、建表（含旧库补列迁移/规则第 1 版回填/证书撤销列）、写事务（BEGIN IMMEDIATE）
   evaluation.py    # 核心审定算法（纯函数）
   report.py        # 修订影响报告（规则前后值、快照比对、时间线对齐，纯函数）
   models.py        # 结论枚举/常量
-  schemas.py       # Pydantic 请求/响应模型（含规则修订）
-  services.py      # 窗口、窗口规则版本化修订、读数（含误采作废/恢复）、审定、签发、修订影响报告业务逻辑
+  schemas.py       # Pydantic 请求/响应模型（含规则修订、证书撤销）
+  services.py      # 窗口、窗口规则版本化修订、读数（含误采作废/恢复）、审定、签发、证书撤销、修订影响报告业务逻辑
   main.py          # FastAPI 路由
 examples/
   curl-examples.sh

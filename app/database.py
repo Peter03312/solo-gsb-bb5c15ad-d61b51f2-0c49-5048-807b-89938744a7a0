@@ -90,7 +90,9 @@ CREATE TABLE IF NOT EXISTS rule_revisions (
 CREATE INDEX IF NOT EXISTS idx_rule_revisions_window
     ON rule_revisions(window_id, rule_revision);
 
--- 证书版本：同一窗口每次签发新增一行，快照不可变
+-- 证书版本：同一窗口每次签发新增一行，快照不可变。
+-- 撤销只改变有效性（revoked_reason/revoked_at），version/verdict/snapshot_json
+-- 一经签发永不修改；一个窗口只有最新签发版本未撤销时才有“当前可用证书”。
 CREATE TABLE IF NOT EXISTS certificates (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     window_id INTEGER NOT NULL REFERENCES windows(id),
@@ -98,6 +100,8 @@ CREATE TABLE IF NOT EXISTS certificates (
     verdict TEXT NOT NULL,
     snapshot_json TEXT NOT NULL,
     note TEXT,
+    revoked_reason TEXT,                    -- 撤销原因（NULL 表示未撤销/有效）
+    revoked_at TEXT,                        -- 撤销操作时间（NULL 表示未撤销/有效）
     issued_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     UNIQUE(window_id, version)
 );
@@ -115,6 +119,11 @@ _COLUMN_MIGRATIONS = (
      "ALTER TABLE reading_revisions ADD COLUMN voided_at TEXT"),
     ("reading_revisions", "prev_revision",
      "ALTER TABLE reading_revisions ADD COLUMN prev_revision INTEGER"),
+    # 证书撤销：撤销只改变有效性（原因/操作时间），原版本、结论与快照不动
+    ("certificates", "revoked_reason",
+     "ALTER TABLE certificates ADD COLUMN revoked_reason TEXT"),
+    ("certificates", "revoked_at",
+     "ALTER TABLE certificates ADD COLUMN revoked_at TEXT"),
 )
 
 
